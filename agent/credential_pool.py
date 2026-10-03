@@ -1038,14 +1038,18 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return bool(self._entries)
 
     def has_available(self, *, model: Optional[str] = None) -> bool:
-        """True if at least one entry is not currently in exhaustion cooldown.
+        """True if at least one entry is currently usable.
 
+        ``clear_expired=True`` also runs the throttled Codex quota-restored
+        probe for a 429-frozen entry. Fallback candidate selection calls this
+        method before constructing a provider client; without the probe, a
+        recovered Codex account remained invisible until manual ``auth reset``.
         ``_available_entries`` is not read-only (it prunes aged-out DEAD
         manual entries and persists), so it must run under ``self._lock``
         like every other caller or a probe can race a concurrent rotation.
         """
         with self._lock:
-            available, _pending = self._available_entries(model=model)
+            available, _pending = self._available_entries(clear_expired=True, model=model)
             return bool(available)
 
     def next_available_at(self, *, model: Optional[str] = None) -> Optional[float]:

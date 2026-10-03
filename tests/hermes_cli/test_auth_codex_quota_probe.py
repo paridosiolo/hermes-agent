@@ -281,6 +281,28 @@ def test_resolver_selects_entry_with_expired_millisecond_reset(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
+def test_has_available_recovers_frozen_codex_entry(tmp_path, monkeypatch):
+    """Fallback eligibility must run the same recovery probe as credential selection."""
+    now = time.time()
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, _pool_only_rate_limited_store(now))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    probes = []
+
+    def _restored(entry):
+        probes.append(entry.id)
+        return True
+
+    monkeypatch.setattr(pool, "_codex_quota_restored_upstream", _restored)
+
+    assert pool.has_available() is True
+    assert probes == ["cred-quota"]
+    assert pool.entries()[0].last_status == "ok"
+    assert pool.entries()[0].last_error_reset_at is None
 
 
 def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
