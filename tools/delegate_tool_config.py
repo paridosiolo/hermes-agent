@@ -367,20 +367,10 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         _merge_request_overrides(request_overrides, explicit_request_overrides),
     )
 
-def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
-    """``delegation.provider`` branch: full bundle via the runtime provider system."""
-    configured_provider = v["provider"]
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
-        ) from exc
-
+def _credential_bundle_from_runtime(
+    configured_provider: str, model: Optional[str], runtime: dict, explicit_request_overrides,
+) -> dict:
+    """Validate one resolved provider runtime and convert it to the child bundle."""
     api_key = runtime.get("api_key", "")
     if not api_key:
         raise ValueError(
@@ -406,12 +396,64 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
             f"configuration / auth, or set delegation.base_url for a direct endpoint."
         )
     return _credential_bundle(
-        v["model"] or runtime.get("model") or None,
+        model or runtime.get("model") or None,
         configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
         runtime.get("base_url"), api_key, runtime.get("api_mode"),
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
     )
+
+
+def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
+    """``delegation.provider`` branch: full bundle via the runtime provider system."""
+    configured_provider = v["provider"]
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+            f"Check that the provider is configured (API key set, valid provider name), "
+            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
+            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
+        ) from exc
+    return _credential_bundle_from_runtime(
+        configured_provider, v["model"], runtime, explicit_request_overrides)
+
+
+def _fallback_entry_credentials(entry: dict, explicit_request_overrides) -> dict:
+    """Resolve one declared child fallback before AIAgent construction."""
+    from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    provider = str(entry.get("provider") or "").strip()
+    model = str(entry.get("model") or "").strip()
+    kwargs = {"requested": provider, "target_model": model}
+    if entry.get("base_url"):
+        kwargs["explicit_base_url"] = entry["base_url"]
+    if api_key := resolve_entry_api_key(entry):
+        kwargs["explicit_api_key"] = api_key
+    runtime = resolve_runtime_provider(**kwargs)
+    provider = effective_runtime_provider(entry, runtime)
+    entry_overrides = entry.get("request_overrides") if isinstance(entry.get("request_overrides"), dict) else None
+    return _credential_bundle_from_runtime(
+        provider, model, runtime,
+        _merge_request_overrides(entry_overrides, explicit_request_overrides),
+    )
+
+
+def _auth_error_in_chain(exc: BaseException) -> bool:
+    """Whether provider resolution failed because credentials are unavailable or rate-limited."""
+    from hermes_cli.auth import AuthError
+
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, AuthError):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
@@ -432,7 +474,36 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             values["model"], None, None, None, None,
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
         )
-    return _runtime_provider_credentials(values, explicit_request_overrides)
+    try:
+        return _runtime_provider_credentials(values, explicit_request_overrides)
+    except ValueError as primary_exc:
+        # The normal AIAgent fallback rail does not exist yet: a provider whose credential pool is
+        # already rate-limited fails here, before child construction. Walk the route owner's declared
+        # chain at this seam, just as cron does during its own pre-agent resolution.
+        if not _auth_error_in_chain(primary_exc):
+            raise
+        chain = _resolve_child_fallback_chain(
+            parent_agent, cfg,
+            pinned=bool(values["provider"] or values["base_url"] or values["model"]),
+        ) or []
+        logger.warning(
+            "Delegation primary provider '%s' could not resolve credentials; %s",
+            values["provider"], "trying fallback chain" if chain else "no child fallback configured",
+        )
+        for entry in chain:
+            try:
+                creds = _fallback_entry_credentials(entry, explicit_request_overrides)
+                logger.info(
+                    "Delegation fallback resolved to %s model %s",
+                    creds.get("provider"), creds.get("model"),
+                )
+                return creds
+            except Exception as fallback_exc:
+                logger.debug(
+                    "Delegation fallback %s/%s failed during credential resolution: %s",
+                    entry.get("provider"), entry.get("model"), fallback_exc,
+                )
+        raise primary_exc
 
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``

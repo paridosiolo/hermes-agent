@@ -14,7 +14,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -937,6 +937,44 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials(cfg, parent)
         self.assertIn("openrouter", str(ctx.exception).lower())
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_rate_limited_primary_resolves_declared_fallback_before_child_creation(self, mock_resolve):
+        """A pinned child must walk its own chain when the primary credential pool is
+        rate-limited before AIAgent exists. Mid-run fallback cannot rescue this seam."""
+        from hermes_cli.auth import AuthError
+
+        mock_resolve.side_effect = [
+            AuthError("Anthropic credentials are rate-limited", provider="anthropic", retryable=True),
+            {
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "codex-oauth-token",
+                "api_mode": "codex_responses",
+                "request_overrides": {},
+            },
+        ]
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "claude-sonnet-5",
+            "provider": "anthropic",
+            "fallback_providers": [
+                {"provider": "openai-codex", "model": "gpt-5.6-terra"}
+            ],
+        }
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["provider"], "openai-codex")
+        self.assertEqual(creds["model"], "gpt-5.6-terra")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        self.assertEqual(
+            mock_resolve.call_args_list,
+            [
+                call(requested="anthropic", target_model="claude-sonnet-5"),
+                call(requested="openai-codex", target_model="gpt-5.6-terra"),
+            ],
+        )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolves_but_no_api_key_raises(self, mock_resolve):
