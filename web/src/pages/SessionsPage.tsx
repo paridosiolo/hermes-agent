@@ -347,9 +347,9 @@ function MessageBubble({
           <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
             {content}
           </div>
-        ) : shouldRenderStructuredReasoning(msg.role, msg.content) ? (
+        ) : shouldRenderStructuredReasoning(msg.role, content) ? (
           <StructuredReasoning
-            content={msg.content}
+            content={content}
             highlightTerms={highlightTerms}
           />
         ) : (
